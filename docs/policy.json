@@ -1,0 +1,55 @@
+{
+  "vaultRolePolicyArn": "arn:aws:iam::399352912234:policy/s3-file-vault-access",
+  "vaultRolePolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ListVaultPrefix",
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket",
+          "s3:ListBucketVersions",
+          "s3:ListBucketMultipartUploads"
+        ],
+        "Resource": "arn:aws:s3:::s3-file-vault-399352912234",
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": ["vault", "vault/*"]
+          }
+        }
+      },
+      {
+        "Sid": "ReadWriteVaultObjects",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:AbortMultipartUpload",
+          "s3:ListMultipartUploadParts"
+        ],
+        "Resource": "arn:aws:s3:::s3-file-vault-399352912234/vault/*"
+      },
+      {
+        "Sid": "UseVaultKey",
+        "Effect": "Allow",
+        "Action": [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
+        ],
+        "Resource": "arn:aws:kms:us-east-1:399352912234:key/faac55d9-6dd5-43da-a3d2-674d3d26200f"
+      }
+    ]
+  },
+  "apiRolePolicyArn": "arn:aws:iam::399352912234:policy/s3-file-vault-api",
+  "apiRoleArn": "arn:aws:iam::399352912234:role/s3-file-vault-api",
+  "bucketPolicySids": [
+    "DenyInsecureTransport",
+    "DenyObjectAccessOutsideVpcEndpoint"
+  ],
+  "vpcEndpointId": "vpce-07aba1bcb4860157e",
+  "adminPrincipalExemptFromVpcDeny": "arn:aws:iam::399352912234:user/ses-smtp-user.20250423-165516"
+}
