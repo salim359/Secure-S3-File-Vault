@@ -1,0 +1,573 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Private S3 file vault reached through API Gateway and a VPC endpoint, encrypted with KMS.
+
+Parameters:
+  ObjectPrefix:
+    Type: String
+    Default: vault
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}(/[A-Za-z0-9][A-Za-z0-9._-]{0,62})*"
+    ConstraintDescription: Use a prefix such as vault or vault/incoming, with no leading or trailing slash.
+    Description: Object key prefix this role may list and access.
+  TrustedPrincipalArn:
+    Type: String
+    Default: ""
+    Description: IAM principal allowed to assume the file vault role. Leave blank to allow principals in this account that already have sts:AssumeRole permission.
+  AdminPrincipalArn:
+    Type: String
+    Default: arn:aws:iam::399352912234:user/ses-smtp-user.20250423-165516
+    Description: Principal that may manage the file vault bucket from outside the VPC endpoint. Object access for everyone else must come through the endpoint.
+
+Conditions:
+  HasTrustedPrincipal: !Not [!Equals [!Ref TrustedPrincipalArn, ""]]
+
+Resources:
+  FileVaultBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "s3-file-vault-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt FileVaultKey.Arn
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          # Test objects only. vault/ has no expiration rule.
+          - Id: ExpireTemporaryTestObjects
+            Status: Enabled
+            Prefix: temporary/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveTemporaryExpiredDeleteMarkers
+            Status: Enabled
+            Prefix: temporary/
+            ExpiredObjectDeleteMarker: true
+
+  FileVaultAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-access"
+      Description: !Sub "Least-privilege access to s3://${FileVaultBucket}/${ObjectPrefix}/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListVaultPrefix
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:ListBucketVersions
+              - s3:ListBucketMultipartUploads
+            Resource: !GetAtt FileVaultBucket.Arn
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - !Ref ObjectPrefix
+                  - !Sub "${ObjectPrefix}/*"
+          - Sid: ReadWriteVaultObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub
+              - "${BucketArn}/${Prefix}/*"
+              - BucketArn: !GetAtt FileVaultBucket.Arn
+                Prefix: !Ref ObjectPrefix
+          - Sid: UseVaultKey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt FileVaultKey.Arn
+
+  FileVaultKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encrypts objects in the file vault bucket.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  FileVaultKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/s3-file-vault
+      TargetKeyId: !Ref FileVaultKey
+
+  FileVaultBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FileVaultBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FileVaultBucket.Arn
+              - !Sub "${FileVaultBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyObjectAccessOutsideVpcEndpoint
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:ListBucket
+              - s3:ListBucketVersions
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:ListBucketMultipartUploads
+            Resource:
+              - !GetAtt FileVaultBucket.Arn
+              - !Sub "${FileVaultBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                aws:sourceVpce: !Ref FileVaultS3Endpoint
+              ArnNotEquals:
+                aws:PrincipalArn: !Ref AdminPrincipalArn
+
+  FileVaultAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-access"
+      Description: Assumes least-privilege access to the file vault object prefix.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TrustVaultPrincipal
+            Effect: Allow
+            Principal:
+              AWS: !If
+                - HasTrustedPrincipal
+                - !Ref TrustedPrincipalArn
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+          - Sid: TrustApiFunction
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-api"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref FileVaultAccessPolicy
+
+  FileVaultCloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "s3-file-vault-trail-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # This bucket stores CloudTrail logs only. vault/ objects are in the file vault bucket.
+          - Id: ExpireAuditLogs
+            Status: Enabled
+            Prefix: AWSLogs/
+            ExpirationInDays: 90
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  FileVaultCloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FileVaultCloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt FileVaultCloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-data-events"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${FileVaultCloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-data-events"
+
+  FileVaultCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: FileVaultCloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-data-events"
+      S3BucketName: !Ref FileVaultCloudTrailBucket
+      IsLogging: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: false
+      IsMultiRegionTrail: false
+      EventSelectors:
+        - IncludeManagementEvents: false
+          ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "${FileVaultBucket.Arn}/"
+
+  FileVaultVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FileVaultVpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FileVaultVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  PrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: File vault API function
+      VpcId: !Ref FileVaultVpc
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudWatch Logs endpoint used by the file vault API
+      VpcId: !Ref FileVaultVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  FileVaultS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref FileVaultVpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowVaultBucket
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:ListBucketVersions
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:ListBucketMultipartUploads
+            Resource:
+              - !GetAtt FileVaultBucket.Arn
+              - !Sub "${FileVaultBucket.Arn}/*"
+
+  FileVaultLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref FileVaultVpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  FileVaultStsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref FileVaultVpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  FileVaultStsDnsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sts-dns"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      CodeUri: sts-dns/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ec2:DescribeVpcEndpoints
+              Resource: "*"
+
+  FileVaultStsDns:
+    Type: Custom::StsDns
+    Properties:
+      ServiceToken: !GetAtt FileVaultStsDnsFunction.Arn
+      EndpointId: !Ref FileVaultStsEndpoint
+
+  FileVaultUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+
+  FileVaultUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref FileVaultUserPool
+      ClientName: !Sub "${AWS::StackName}-web"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  FileVaultApiPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-api-session"
+      Description: Allows the API function to assume a session limited to one person's vault prefix.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumePrefixSession
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-access"
+
+  FileVaultApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-api"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref FileVaultApiPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  FileVaultHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !GetAtt FileVaultUserPool.ProviderURL
+              audience:
+                - !Ref FileVaultUserPoolClient
+      CorsConfiguration:
+        AllowOrigins:
+          - http://127.0.0.1:3000
+          - http://localhost:3000
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+          - authorization
+        ExposeHeaders:
+          - x-version-id
+        MaxAge: 600
+
+  FileVaultApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api"
+      CodeUri: api/
+      Handler: handler.handler
+      Runtime: nodejs24.x
+      Architectures:
+        - arm64
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt FileVaultApiRole.Arn
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FileVaultBucket
+          KMS_KEY_ARN: !GetAtt FileVaultKey.Arn
+          ROLE_ARN: !GetAtt FileVaultApiRole.Arn
+          ACCESS_ROLE_ARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-access"
+          STS_ENDPOINT: !Sub
+            - "https://${DnsName}"
+            - DnsName: !GetAtt FileVaultStsDns.DnsName
+          VPC_ENDPOINT_ID: !Ref FileVaultS3Endpoint
+      Events:
+        Status:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FileVaultHttpApi
+            Method: GET
+            Path: /status
+        ListObjects:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FileVaultHttpApi
+            Method: GET
+            Path: /objects
+        StoreObject:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FileVaultHttpApi
+            Method: POST
+            Path: /objects
+        ListVersions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FileVaultHttpApi
+            Method: GET
+            Path: /versions
+        ReadContent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FileVaultHttpApi
+            Method: GET
+            Path: /content
+
+Outputs:
+  FileVaultBucketName:
+    Description: Name of the file vault bucket
+    Value: !Ref FileVaultBucket
+  FileVaultBucketArn:
+    Description: ARN of the file vault bucket
+    Value: !GetAtt FileVaultBucket.Arn
+  FileVaultObjectPrefix:
+    Description: Object prefix the access role is limited to
+    Value: !Ref ObjectPrefix
+  FileVaultTemporaryPrefix:
+    Description: Prefix whose test objects expire after 7 days. vault/ is not covered.
+    Value: temporary/
+  FileVaultAccessRoleArn:
+    Description: Role with least-privilege access to the vault prefix
+    Value: !GetAtt FileVaultAccessRole.Arn
+  FileVaultAccessPolicyArn:
+    Description: Managed policy that can be attached to a user or role
+    Value: !Ref FileVaultAccessPolicy
+  FileVaultCloudTrailArn:
+    Description: Trail recording object-level API activity for the file vault bucket
+    Value: !GetAtt FileVaultCloudTrail.Arn
+  FileVaultCloudTrailBucketName:
+    Description: Bucket that stores CloudTrail log files. Logs under AWSLogs/ expire after 90 days.
+    Value: !Ref FileVaultCloudTrailBucket
+  FileVaultApiUrl:
+    Description: API Gateway URL used by the client
+    Value: !GetAtt FileVaultHttpApi.ApiEndpoint
+  FileVaultS3EndpointId:
+    Description: Gateway VPC endpoint required for object access
+    Value: !Ref FileVaultS3Endpoint
+  FileVaultKeyArn:
+    Description: KMS key that encrypts file vault objects
+    Value: !GetAtt FileVaultKey.Arn
+  FileVaultUserPoolId:
+    Description: Cognito user pool for sign-in
+    Value: !Ref FileVaultUserPool
+  FileVaultUserPoolClientId:
+    Description: Cognito app client for the browser
+    Value: !Ref FileVaultUserPoolClient
